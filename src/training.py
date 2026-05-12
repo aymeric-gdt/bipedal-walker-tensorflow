@@ -17,17 +17,6 @@ from collections import deque
 
 import tensorflow as tf
 try:
-    from torch.utils.tensorboard import SummaryWriter
-    _HAS_TB = True
-except ImportError:
-    try:
-        from tensorboard.summary.writer.event_file_writer import EventFileWriter as _  # noqa
-        from tensorflow.summary import create_file_writer
-        _HAS_TB = False  # utiliser tf.summary directement
-    except ImportError:
-        _HAS_TB = False
-
-try:
     from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
     _HAS_SB3 = True
 except ImportError:
@@ -89,33 +78,26 @@ def make_vec_env(env_id: str, n_envs: int = 8, seed: int = 0,
 
 
 class TensorBoardLogger:
-    """Wrapper TensorBoard — compatible torch.utils.tensorboard et tf.summary."""
+    """Logger TensorBoard natif TensorFlow — pas de dépendance torch."""
 
     def __init__(self, log_dir: str):
         self.log_dir = log_dir
-        if _HAS_TB:
-            self.writer = SummaryWriter(log_dir)
-            self._mode = "torch"
-        else:
-            self.writer = tf.summary.create_file_writer(log_dir)
-            self._mode = "tf"
+        self.writer = tf.summary.create_file_writer(log_dir)
 
     def log_scalar(self, tag: str, value: float, step: int):
-        if self._mode == "torch":
-            self.writer.add_scalar(tag, value, step)
-        else:
-            with self.writer.as_default():
-                tf.summary.scalar(tag, value, step=step)
+        with self.writer.as_default():
+            tf.summary.scalar(tag, value, step=step)
+        self.writer.flush()
 
     def log_scalars(self, tag_group: str, values: dict, step: int):
-        for k, v in values.items():
-            self.log_scalar(f"{tag_group}/{k}", v, step)
+        with self.writer.as_default():
+            for k, v in values.items():
+                tf.summary.scalar(f"{tag_group}/{k}", v, step=step)
+        self.writer.flush()
 
     def close(self):
-        if self._mode == "torch":
-            self.writer.close()
-        else:
-            self.writer.flush()
+        self.writer.flush()
+        self.writer.close()
 
 
 class TrainingRunner:
@@ -167,33 +149,42 @@ class TrainingRunner:
         print(f"=== Entraînement PPO — {env_id} ===")
         print(f"Seed: {seed}")
         print(f"Log: {self.log_dir}")
+        print(f"TensorBoard: tensorboard --logdir={self.log_dir}")
         print(f"n_envs: {config.n_envs}, n_steps: {config.n_steps}")
         print(f"Total timesteps: {config.total_timesteps:,}")
         print(f"Observations: {self.obs_dim}D, Actions: {self.action_dim}D")
 
-    def _log(self, stats: dict, rollout_stats: dict, train_stats: dict):
-        """Log vers TensorBoard."""
+    def _log(self, rollout_stats: dict, train_stats: dict):
+        """Log vers TensorBoard — métriques riches PPO."""
         step = self.global_step
 
-        self.tb.log_scalar("rollout/mean_reward", rollout_stats["mean_reward"], step)
-        self.tb.log_scalar("rollout/mean_ep_reward", rollout_stats["mean_ep_reward"], step)
-        self.tb.log_scalar("rollout/mean_length", rollout_stats["mean_length"], step)
-        self.tb.log_scalar("rollout/episodes_finished", rollout_stats["episodes_finished"], step)
+        # --- Rollout ---
+        self.tb.log_scalar("rollout/ep_rew_mean", rollout_stats.get("mean_ep_reward", 0.0), step)
+        self.tb.log_scalar("rollout/ep_len_mean", rollout_stats.get("mean_ep_length", 0.0), step)
+        self.tb.log_scalar("rollout/episodes", rollout_stats.get("episodes_finished", 0), step)
+        self.tb.log_scalar("rollout/mean_reward", rollout_stats.get("mean_reward", 0.0), step)
 
-        self.tb.log_scalars("losses", {
-            "total": train_stats["total_loss"],
-            "policy": train_stats["policy_loss"],
-            "value": train_stats["value_loss"],
+        # --- Train / Losses ---
+        self.tb.log_scalars("train", {
+            "policy_loss": train_stats["policy_loss"],
+            "value_loss": train_stats["value_loss"],
             "entropy": train_stats["entropy"],
+            "approx_kl": train_stats.get("approx_kl", 0.0),
+            "clip_fraction": train_stats.get("clip_fraction", 0.0),
+            "explained_variance": train_stats.get("explained_variance", 0.0),
         }, step)
 
+        # --- Optim ---
         self.tb.log_scalar("opt/learning_rate", train_stats["lr"], step)
-        self.tb.log_scalar("rollout/obs_norm_count", self.agent.model.obs_norm.count, step)
 
-        # Temps
+        # --- Timing ---
         elapsed = time.time() - self.wall_start
-        steps_per_sec = self.global_step / elapsed
+        steps_per_sec = self.global_step / elapsed if elapsed > 0 else 0.0
         self.tb.log_scalar("timing/steps_per_sec", steps_per_sec, step)
+        self.tb.log_scalar("timing/fps", steps_per_sec, step)
+
+        # --- Debug ---
+        self.tb.log_scalar("debug/obs_norm_count", float(self.agent.model.obs_norm.count), step)
 
     def _should_stop_early(self) -> bool:
         """Early stopping si reward moyen > seuil sur la fenêtre."""
@@ -227,7 +218,7 @@ class TrainingRunner:
             )
 
             # --- Logging ---
-            self._log(rollout_stats, rollout_stats, train_stats)
+            self._log(rollout_stats, train_stats)
 
             # --- Reward history ---
             if rollout_stats["mean_ep_reward"] != 0:

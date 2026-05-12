@@ -298,6 +298,11 @@ class PPOAgent:
                 )
 
                 ratio = tf.exp(log_prob_new - log_probs_old)
+                approx_kl = tf.reduce_mean(log_probs_old - log_prob_new)
+                clip_fraction = tf.reduce_mean(
+                    tf.cast(tf.abs(ratio - 1.0) > self.config.clip_ratio, tf.float32)
+                )
+
                 surr1 = ratio * advantages
                 surr2 = tf.clip_by_value(ratio,
                                           1.0 - self.config.clip_ratio,
@@ -339,6 +344,8 @@ class PPOAgent:
                 "value_loss": critic_loss,
                 "entropy": entropy,
                 "log_std_mean": tf.reduce_mean(log_std),
+                "approx_kl": approx_kl,
+                "clip_fraction": clip_fraction,
             }
         return _train_step
 
@@ -354,6 +361,7 @@ class PPOAgent:
         """
         n_samples = obs.shape[0]
         policy_losses, value_losses, entropies, log_std_means = [], [], [], []
+        approx_kls, clip_fractions = [], []
         lr = tf.constant(self._get_lr(), dtype=tf.float32)
 
         for _ in range(n_epochs):
@@ -369,13 +377,22 @@ class PPOAgent:
                 value_losses.append(float(losses["value_loss"]))
                 entropies.append(float(losses["entropy"]))
                 log_std_means.append(float(losses["log_std_mean"]))
+                approx_kls.append(float(losses["approx_kl"]))
+                clip_fractions.append(float(losses["clip_fraction"]))
 
         self.iteration += 1
+
+        # --- Explained variance (sur tout le batch) ---
+        obs_t_all = tf.constant(obs, dtype=tf.float32)
+        values_pred = tf.squeeze(self.model.critic(obs_t_all), axis=-1)
+        values_pred_np = tf.cast(values_pred, tf.float32).numpy()
+        ev = 1.0 - np.var(returns - values_pred_np) / (np.var(returns) + 1e-8)
 
         # Diagnostic post-update
         raw_ls = self.model.actor.log_std.numpy()
         print(f"    [DIAG] log_std={np.round(raw_ls, 4)}  entropy={np.mean(entropies):.4f}  "
-              f"policy_loss={np.mean(policy_losses):.4f}  value_loss={np.mean(value_losses):.4f}")
+              f"policy_loss={np.mean(policy_losses):.4f}  value_loss={np.mean(value_losses):.4f}  "
+              f"kl={np.mean(approx_kls):.5f}  clip={np.mean(clip_fractions):.3f}  ev={ev:.3f}")
 
         return {
             "total_loss": float(np.mean(policy_losses)) + float(np.mean(value_losses)),
@@ -383,6 +400,9 @@ class PPOAgent:
             "value_loss": float(np.mean(value_losses)),
             "entropy": float(np.mean(entropies)),
             "lr": float(lr),
+            "approx_kl": float(np.mean(approx_kls)),
+            "clip_fraction": float(np.mean(clip_fractions)),
+            "explained_variance": float(ev),
         }
 
     def save(self, path: str):
@@ -390,8 +410,8 @@ class PPOAgent:
         self.model.actor.save_weights(f"{path}_actor.weights.h5")
         self.model.critic.save_weights(f"{path}_critic.weights.h5")
         np.savez(f"{path}_obs_norm.npz",
-                 mean=self.model.obs_norm.mean,
-                 var=self.model.obs_norm.var,
+                 mean=self.model.obs_norm.mean.numpy(),
+                 var=self.model.obs_norm.var.numpy(),
                  count=self.model.obs_norm.count)
 
     def load(self, path: str):
@@ -399,6 +419,8 @@ class PPOAgent:
         self.model.actor.load_weights(f"{path}_actor.weights.h5")
         self.model.critic.load_weights(f"{path}_critic.weights.h5")
         data = np.load(f"{path}_obs_norm.npz")
-        self.model.obs_norm.mean = data["mean"]
-        self.model.obs_norm.var = data["var"]
-        self.model.obs_norm.count = data["count"]
+        self.model.obs_norm.mean.assign(data["mean"])
+        self.model.obs_norm.var.assign(data["var"])
+        self.model.obs_norm.mean_np = data["mean"]
+        self.model.obs_norm.var_np = data["var"]
+        self.model.obs_norm.count = int(data["count"])
