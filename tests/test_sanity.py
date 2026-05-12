@@ -61,6 +61,8 @@ def test_forward_pass():
 
     # Log prob
     log_prob, value = model.get_log_prob_and_value(obs_batch, action)
+    log_prob = log_prob.numpy()
+    value = value.numpy()
     assert log_prob.shape == (1,), f"Log prob shape attendu (1,), got {log_prob.shape}"
     assert np.isfinite(log_prob), "Log prob contient NaN/Inf"
 
@@ -73,6 +75,7 @@ class DummyEnv:
 
     def __init__(self, n_envs=2):
         self.n_envs = n_envs
+        self.num_envs = n_envs
         self.obs_dim = 24
         self.action_dim = 4
         self.action_space = type("obj", (), {"shape": (4,)})()
@@ -141,7 +144,7 @@ def test_training_loop_mini():
     losses = []
     for _ in range(10):  # 10 itérations
         agent.rollout(env, n_steps=8)
-        obs, actions, log_probs_old, advantages, returns = agent.buffer.get_batch()
+        obs, actions, log_probs_old, advantages, returns, values_old = agent.buffer.get_flat()
 
         # Normalize advantages pour le test
         advantages = (advantages - np.mean(advantages)) / (np.std(advantages) + 1e-8)
@@ -154,6 +157,7 @@ def test_training_loop_mini():
             log_probs_old=log_probs_old,
             advantages=advantages,
             returns=returns,
+            values_old=values_old,
         )
         losses.append(stats["total_loss"])
 

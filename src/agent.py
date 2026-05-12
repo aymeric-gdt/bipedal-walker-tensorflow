@@ -152,6 +152,9 @@ class PPOAgent:
             rew_clip=config.rew_clip,
         )
 
+        # Fonction d'entraînement compilée (XLA si activé)
+        self._train_step = self._make_train_step()
+
         self.iteration = 0
         # Obs courante persistée entre rollouts
         self._last_obs = None
@@ -163,6 +166,28 @@ class PPOAgent:
             progress = self.iteration / max(total_iters, 1)
             return self.config.lr * max(0.0, 1.0 - progress)
         return self.config.lr
+
+    @tf.function(jit_compile=True)
+    def _rollout_forward(self, obs_norm_t: tf.Tensor) -> tuple:
+        """Forward pass GPU complet pour un batch d'observations normalisées.
+
+        Retourne (actions, log_probs, values) — tout reste sur GPU.
+        """
+        mu, log_std = self.model.actor.get_action_dist(obs_norm_t)
+        std = tf.exp(log_std)
+        # Mixed precision : noise doit matcher le dtype de mu (float16 ou float32)
+        noise = tf.random.normal(tf.shape(mu), dtype=mu.dtype)
+        actions = mu + std * noise
+        # Clamp pour rester dans [-1, 1] (Box2D action space)
+        actions = tf.clip_by_value(actions, -1.0, 1.0)
+
+        _pi = tf.constant(np.pi, dtype=mu.dtype)
+        log_probs = tf.reduce_sum(
+            -0.5 * (((actions - mu) / std) ** 2 + 2.0 * log_std + tf.math.log(2.0 * _pi)),
+            axis=-1,
+        )
+        values = tf.squeeze(self.model.critic(obs_norm_t), axis=-1)
+        return actions, log_probs, values
 
     def rollout(self, envs, n_steps: int) -> dict:
         """Collecte n_steps transitions avec les envs parallèles.
@@ -180,17 +205,18 @@ class PPOAgent:
         ep_length = np.zeros(envs.num_envs, dtype=np.float32)
 
         for step in range(n_steps):
-            # Normaliser + mettre à jour les stats
+            # Met à jour les stats de normalisation (CPU) puis normalise sur GPU
             self.model.obs_norm.update(obs_batch)
-            obs_norm = self.model.obs_norm.normalize(obs_batch)
+            obs_t = tf.convert_to_tensor(obs_batch, dtype=tf.float32)
+            obs_norm_t = self.model.obs_norm.normalize(obs_t)
 
-            # Actions stochastiques
-            obs_t = tf.convert_to_tensor(obs_norm, dtype=tf.float32)
-            actions = self.model.actor.sample(obs_t).numpy()
+            # Forward pass GPU unique (actor + critic fusionnés)
+            actions_t, log_probs_t, values_t = self._rollout_forward(obs_norm_t)
 
-            # Log probs et values sur obs normalisées
-            log_probs = self.model.actor.log_prob(obs_t, tf.convert_to_tensor(actions, dtype=tf.float32)).numpy()
-            values = self.model.critic(obs_t).numpy().flatten()
+            # Unique transfert CPU/GPU pour env.step()
+            actions = actions_t.numpy()
+            log_probs = log_probs_t.numpy()
+            values = values_t.numpy()
 
             obs_next, rewards, dones, infos = envs.step(actions)
 
@@ -204,19 +230,18 @@ class PPOAgent:
                     ep_reward[env_idx] = 0.0
                     ep_length[env_idx] = 0.0
 
-            # Store dans buffer (obs normalisées)
-            self.buffer.store_step(step, obs_norm, actions, rewards, dones, values, log_probs)
+            # Store dans buffer (obs normalisées CPU)
+            self.buffer.store_step(step, obs_norm_t.numpy(), actions, rewards, dones, values, log_probs)
 
             obs_batch = obs_next
 
         self._last_obs = obs_batch
 
-        # Bootstrap last values
+        # Bootstrap last values (forward pass GPU)
         self.model.obs_norm.update(obs_batch)
-        obs_norm_last = self.model.obs_norm.normalize(obs_batch)
-        last_values = self.model.critic(
-            tf.convert_to_tensor(obs_norm_last, dtype=tf.float32)
-        ).numpy().flatten()
+        obs_t = tf.convert_to_tensor(obs_batch, dtype=tf.float32)
+        obs_norm_last_t = self.model.obs_norm.normalize(obs_t)
+        last_values = self._rollout_forward(obs_norm_last_t)[2].numpy()
 
         # Compute GAE
         advantages, returns = self.buffer.compute_gae_returns(last_values)
@@ -232,74 +257,90 @@ class PPOAgent:
         }
         return stats
 
-    @tf.function
-    def _train_step(self, obs: tf.Tensor, actions: tf.Tensor,
-                    log_probs_old: tf.Tensor,
-                    advantages: tf.Tensor,
-                    returns: tf.Tensor,
-                    values_old: tf.Tensor,
-                    lr: tf.Tensor) -> dict:
-        """Une passe d'entraînement PPO (tf.function pour performance)."""
-        # Normalise advantages (par batch)
-        if self.config.normalize_advantage:
-            advantages = (advantages - tf.reduce_mean(advantages)) / (tf.math.reduce_std(advantages) + 1e-8)
+    def _make_train_step(self):
+        """Construit la fonction d'entraînement PPO avec XLA si demandé."""
+        jit = self.config.xla_jit
 
-        actor_vars = self.model.actor.trainable_variables
-        critic_vars = self.model.critic.trainable_variables
+        @tf.function(jit_compile=jit)
+        def _train_step(obs: tf.Tensor, actions: tf.Tensor,
+                        log_probs_old: tf.Tensor,
+                        advantages: tf.Tensor,
+                        returns: tf.Tensor,
+                        values_old: tf.Tensor,
+                        lr: tf.Tensor) -> dict:
+            """Une passe d'entraînement PPO (graphée + XLA)."""
+            # --- Aligne les dtypes (mixed precision) ---
+            # mu est en float16 si mixed_precision, buffers numpy sont float32
+            mu_ref, _ = self.model.actor.get_action_dist(obs)
+            target_dtype = mu_ref.dtype
+            actions = tf.cast(actions, target_dtype)
+            log_probs_old = tf.cast(log_probs_old, target_dtype)
+            advantages = tf.cast(advantages, target_dtype)
+            returns = tf.cast(returns, target_dtype)
+            values_old = tf.cast(values_old, target_dtype)
 
-        # --- Actor update ---
-        with tf.GradientTape() as tape_actor:
-            mu, log_std = self.model.actor.get_action_dist(obs)
-            std = tf.exp(log_std)
+            # Normalise advantages (par batch)
+            if self.config.normalize_advantage:
+                advantages = (advantages - tf.reduce_mean(advantages)) / (tf.math.reduce_std(advantages) + 1e-8)
 
-            log_prob_new = tf.reduce_sum(
-                -0.5 * (((actions - mu) / std) ** 2 + 2.0 * log_std + tf.math.log(2.0 * np.pi)),
-                axis=-1
-            )
+            actor_vars = self.model.actor.trainable_variables
+            critic_vars = self.model.critic.trainable_variables
 
-            ratio = tf.exp(log_prob_new - log_probs_old)
-            surr1 = ratio * advantages
-            surr2 = tf.clip_by_value(ratio,
-                                      1.0 - self.config.clip_ratio,
-                                      1.0 + self.config.clip_ratio) * advantages
-            policy_loss = -tf.reduce_mean(tf.minimum(surr1, surr2))
+            # --- Actor update ---
+            with tf.GradientTape() as tape_actor:
+                mu, log_std = self.model.actor.get_action_dist(obs)
+                std = tf.exp(log_std)
+                _pi = tf.constant(np.pi, dtype=mu.dtype)
 
-            # Entropy : H = 0.5 * (1 + log(2π σ²)) per dim, summed over action dims
-            entropy = tf.reduce_mean(
-                tf.reduce_sum(0.5 * (1.0 + tf.math.log(2.0 * np.pi * std ** 2)), axis=-1)
-            )
-            actor_loss = policy_loss - self.config.entropy_coef * entropy
+                log_prob_new = tf.reduce_sum(
+                    -0.5 * (((actions - mu) / std) ** 2 + 2.0 * log_std + tf.math.log(2.0 * _pi)),
+                    axis=-1
+                )
 
-        actor_grads = tape_actor.gradient(actor_loss, actor_vars)
-        actor_grads, _ = tf.clip_by_global_norm(actor_grads, self.config.max_grad_norm)
-        self.actor_optimizer.learning_rate.assign(lr)
-        self.actor_optimizer.apply_gradients(zip(actor_grads, actor_vars))
+                ratio = tf.exp(log_prob_new - log_probs_old)
+                surr1 = ratio * advantages
+                surr2 = tf.clip_by_value(ratio,
+                                          1.0 - self.config.clip_ratio,
+                                          1.0 + self.config.clip_ratio) * advantages
+                policy_loss = -tf.reduce_mean(tf.minimum(surr1, surr2))
 
-        # --- Critic update ---
-        with tf.GradientTape() as tape_critic:
-            values_new = tf.squeeze(self.model.critic(obs), axis=-1)
+                # Entropy : H = 0.5 * (1 + log(2π σ²)) per dim, summed over action dims
+                entropy = tf.reduce_mean(
+                    tf.reduce_sum(0.5 * (1.0 + tf.math.log(2.0 * _pi * std ** 2)), axis=-1)
+                )
+                actor_loss = policy_loss - self.config.entropy_coef * entropy
 
-            # Value clipping (Engstrom et al.)
-            v_clipped = values_old + tf.clip_by_value(
-                values_new - values_old,
-                -self.config.value_clip,
-                self.config.value_clip
-            )
-            v_loss1 = tf.square(values_new - returns)
-            v_loss2 = tf.square(v_clipped - returns)
-            critic_loss = 0.5 * tf.reduce_mean(tf.maximum(v_loss1, v_loss2)) * self.config.value_coef
+            actor_grads = tape_actor.gradient(actor_loss, actor_vars)
+            actor_grads, _ = tf.clip_by_global_norm(actor_grads, self.config.max_grad_norm)
+            self.actor_optimizer.learning_rate.assign(lr)
+            self.actor_optimizer.apply_gradients(zip(actor_grads, actor_vars))
 
-        critic_grads = tape_critic.gradient(critic_loss, critic_vars)
-        critic_grads, _ = tf.clip_by_global_norm(critic_grads, self.config.max_grad_norm)
-        self.critic_optimizer.learning_rate.assign(lr)
-        self.critic_optimizer.apply_gradients(zip(critic_grads, critic_vars))
+            # --- Critic update ---
+            with tf.GradientTape() as tape_critic:
+                values_new = tf.squeeze(self.model.critic(obs), axis=-1)
 
-        return {
-            "policy_loss": policy_loss,
-            "value_loss": critic_loss,
-            "entropy": entropy,
-            "log_std_mean": tf.reduce_mean(log_std),
-        }
+                # Value clipping (Engstrom et al.)
+                v_clipped = values_old + tf.clip_by_value(
+                    values_new - values_old,
+                    -self.config.value_clip,
+                    self.config.value_clip
+                )
+                v_loss1 = tf.square(values_new - returns)
+                v_loss2 = tf.square(v_clipped - returns)
+                critic_loss = 0.5 * tf.reduce_mean(tf.maximum(v_loss1, v_loss2)) * self.config.value_coef
+
+            critic_grads = tape_critic.gradient(critic_loss, critic_vars)
+            critic_grads, _ = tf.clip_by_global_norm(critic_grads, self.config.max_grad_norm)
+            self.critic_optimizer.learning_rate.assign(lr)
+            self.critic_optimizer.apply_gradients(zip(critic_grads, critic_vars))
+
+            return {
+                "policy_loss": policy_loss,
+                "value_loss": critic_loss,
+                "entropy": entropy,
+                "log_std_mean": tf.reduce_mean(log_std),
+            }
+        return _train_step
 
     def update(self, batch_size: int, n_epochs: int,
                obs: np.ndarray, actions: np.ndarray,
@@ -307,27 +348,23 @@ class PPOAgent:
                advantages: np.ndarray,
                returns: np.ndarray,
                values_old: np.ndarray) -> dict:
-        """Effectue n_epochs de mise à jour PPO sur le rollout buffer."""
+        """Effectue n_epochs de mise à jour PPO sur le rollout buffer.
+
+        Utilise tf.data.Dataset pour shuffle+batch+prefetch (meilleur throughput GPU).
+        """
         n_samples = obs.shape[0]
-        indices = np.arange(n_samples)
-
         policy_losses, value_losses, entropies, log_std_means = [], [], [], []
-
         lr = tf.constant(self._get_lr(), dtype=tf.float32)
 
         for _ in range(n_epochs):
-            np.random.shuffle(indices)
-            for start in range(0, n_samples, batch_size):
-                idx = indices[start:start + batch_size]
-                losses = self._train_step(
-                    tf.constant(obs[idx], dtype=tf.float32),
-                    tf.constant(actions[idx], dtype=tf.float32),
-                    tf.constant(log_probs_old[idx], dtype=tf.float32),
-                    tf.constant(advantages[idx], dtype=tf.float32),
-                    tf.constant(returns[idx], dtype=tf.float32),
-                    tf.constant(values_old[idx], dtype=tf.float32),
-                    lr,
-                )
+            dataset = tf.data.Dataset.from_tensor_slices((
+                obs, actions, log_probs_old, advantages, returns, values_old
+            ))
+            dataset = dataset.shuffle(n_samples)
+            dataset = dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+
+            for batch in dataset:
+                losses = self._train_step(*batch, lr)
                 policy_losses.append(float(losses["policy_loss"]))
                 value_losses.append(float(losses["value_loss"]))
                 entropies.append(float(losses["entropy"]))

@@ -18,7 +18,7 @@ class PPOConfig:
 
     # --- Optimisation ---
     n_epochs: int = 10               # nombre de passes SGD sur le rollout buffer
-    batch_size: int = 64             # mini-batch size
+    batch_size: int = 512             # mini-batch size (plus gros = meilleur GPU saturation)
     lr: float = 3e-4                 # learning rate initial (Adam)
     lr_annealing: bool = True         # linear decay vers 0
     adam_epsilon: float = 1e-5        # epsilon pour Adam (plus grand que défaut TF)
@@ -60,6 +60,11 @@ class PPOConfig:
     seed: int = 0                   # graine principale
     n_seeds: int = 3                # nombre de seeds à runner
     log_interval: int = 1            # intervalle de logging TensorBoard
+
+    # --- GPU / Performance ---
+    use_mixed_precision: bool = True  # float16 forward pass pour 2-3x speedup sur RTX/Ampere
+    gpu_memory_growth: bool = True    # évite d'allouer toute la VRAM d'un coup
+    xla_jit: bool = True              # XLA compilation pour les @tf.function
 
 
 # Singleton

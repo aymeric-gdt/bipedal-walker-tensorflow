@@ -37,6 +37,30 @@ from src.config import PPOConfig
 from src.agent import PPOAgent
 
 
+def setup_gpu(config: PPOConfig):
+    """Configure GPU pour TensorFlow : memory growth + mixed precision."""
+    gpus = tf.config.list_physical_devices('GPU')
+    if gpus:
+        try:
+            for gpu in gpus:
+                if config.gpu_memory_growth:
+                    tf.config.experimental.set_memory_growth(gpu, True)
+            print(f"GPUs detected: {len(gpus)}")
+            for gpu in gpus:
+                print(f"  - {gpu.name}")
+        except RuntimeError as e:
+            print(f"GPU config error: {e}")
+    else:
+        print("WARNING: No GPU detected — training will run on CPU")
+
+    if config.use_mixed_precision:
+        tf.keras.mixed_precision.set_global_policy('mixed_float16')
+        print("Mixed precision (float16) enabled")
+    else:
+        print("Mixed precision disabled (float32)")
+    print()
+
+
 def make_vec_env(env_id: str, n_envs: int = 8, seed: int = 0,
                  use_subproc: bool = True):
     """Crée un vectorized environment.
@@ -245,6 +269,7 @@ class TrainingRunner:
 def train_single_seed(env_id: str, config: PPOConfig, seed: int,
                       log_dir: str = None) -> dict:
     """Lance l'entraînement pour une graine."""
+    setup_gpu(config)
     runner = TrainingRunner(config=config, env_id=env_id, seed=seed, log_dir=log_dir)
     runner.run()
     return {
